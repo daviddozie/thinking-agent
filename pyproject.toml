@@ -1,0 +1,10 @@
+[project]
+name = "thinking-agent"
+version = "0.1.0"
+description = "A thinking agent that uses langchain agents to interact with the MCP server and provide expert advice on agricultural topics."
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = []
+
+[tool.uv]
+workspace = { members = ["mcp_server", "agent_client"] }
