@@ -103,7 +103,7 @@ Both streams are written to `agent_client/agent_system.log`.
 
 **1. Clone the repository**
 ```bash
-git clone https://github.com/david_dozie/thinking-agent.git
+git clone https://github.com/daviddozie/thinking-agent.git
 cd thinking-agent
 ```
 
