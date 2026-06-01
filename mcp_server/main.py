@@ -1,3 +1,4 @@
+from mcp.types import SamplingMessage, TextContent as MCPTextContent
 import logging
 import os
 from datetime import datetime
@@ -76,11 +77,11 @@ def hierarchical_search(queries: list[str]) -> list[dict]:
     return results
 
 
-def tot_evaluate(chunks: list[dict], query: str) -> str:
+def tot_evaluate(chunks: list[dict], query: str) -> list[dict]:
     """
     Tree-of-Thought evaluation, score each chunk across
     3 reasoning paths and filter out low relevance results.
-    Threshold: average score must be >= 6 out of 10.
+    Threshold: average score must be >= 4 out of 10.
     """
     logger.info("Initiating ToT Evaluation on retrieved chunks...")
     scored = []
@@ -143,7 +144,7 @@ async def agricultural_knowledge(query: str) -> str:
                 for r in tavily_results.get("results", [])
             )
             logger.info("Tavily fallback successful")
-            return f"[FALLBACK - Web Results]\n\n{fallback_content}"
+            return f"[FALLBACK, Web Results]\n\n{fallback_content}"
         except Exception as e:
             logger.error(f"Tavily fallback failed: {e}")
             return "No relevant knowledge found and web fallback failed."
@@ -162,40 +163,78 @@ async def agricultural_knowledge(query: str) -> str:
 
 
 # Reflector tool
-
-
 @mcp.tool()
 async def reflect_on_answer(
     original_query: str,
     draft_answer: str,
-    ctx: Context
+    ctx: Context,
 ) -> str:
     """
-    Reflection tool — returns critique and correction prompts.
-    The client handles LLM generation and returns the result.
+    Reflection tool, uses true MCP Sampling to delegate LLM
+    critique and correction back to the client's model.
+    The server holds no API key and makes no direct LLM calls.
     """
     logger.info(f"Reflection tool invoked for query: '{original_query}'")
+    await ctx.info(f"Reflection tool invoked for query: '{original_query}'")
 
-    critique_prompt = (
-        f"You are an expert agricultural advisor reviewing an answer.\n\n"
-        f"Original Question: {original_query}\n\n"
-        f"Draft Answer: {draft_answer}\n\n"
-        f"Critique this answer. Identify any factual errors, missing key points, "
-        f"or areas that could be improved for a farmer or agronomist. "
-        f"Be specific and concise."
+    # Critique Loop via MCP Sampling
+    logger.info("Requesting critique sample from client LLM via MCP Sampling...")
+    await ctx.info("Initiating critique loop via MCP Sampling...")
+
+    critique_result = await ctx.sample(
+        messages=[
+            SamplingMessage(
+                role="user",
+                content=MCPTextContent(
+                    type="text",
+                    text=(
+                        f"You are an expert agricultural advisor reviewing an answer.\n\n"
+                        f"Original Question: {original_query}\n\n"
+                        f"Draft Answer: {draft_answer}\n\n"
+                        f"Critique this answer. Identify any factual errors, missing key points, "
+                        f"or areas that could be improved for a farmer or agronomist. "
+                        f"Be specific and concise."
+                    ),
+                ),
+            )
+        ],
+        max_tokens=500,
     )
+    critique_text = critique_result.text
+    logger.info("Critique sample received from client LLM")
+    await ctx.info("Critique sample received from client LLM")
 
-    correction_prompt = (
-        f"You are an expert agricultural advisor.\n\n"
-        f"Original Question: {original_query}\n\n"
-        f"Draft Answer: {draft_answer}\n\n"
-        f"Write an improved, corrected final answer. "
-        f"Be clear, accurate, and practical for a farmer."
+    # Correction Loop via MCP Sampling
+    logger.info("Requesting correction sample from client LLM via MCP Sampling...")
+    await ctx.info("Initiating correction loop via MCP Sampling...")
+
+    correction_result = await ctx.sample(
+        messages=[
+            SamplingMessage(
+                role="user",
+                content=MCPTextContent(
+                    type="text",
+                    text=(
+                        f"You are an expert agricultural advisor.\n\n"
+                        f"Original Question: {original_query}\n\n"
+                        f"Draft Answer: {draft_answer}\n\n"
+                        f"Critique: {critique_text}\n\n"
+                        f"Now write an improved, corrected final answer that addresses "
+                        f"the critique. Be clear, accurate, and practical for a farmer."
+                    ),
+                ),
+            )
+        ],
+        max_tokens=700,
     )
+    corrected_answer = correction_result.text
+    logger.info("Correction sample received from client LLM")
+    await ctx.info("Correction sample received from client LLM")
 
-    logger.info("Returning reflection prompts to client for LLM execution")
-
-    return f"CRITIQUE_PROMPT:{critique_prompt}|||CORRECTION_PROMPT:{correction_prompt}"
+    return (
+        f"[CRITIQUE]\n{critique_text}\n\n"
+        f"[CORRECTED ANSWER]\n{corrected_answer}"
+    )
 
 #Run server
 def main():

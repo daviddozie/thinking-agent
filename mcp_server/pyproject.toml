@@ -1,14 +1,11 @@
 [project]
 name = "mcp-server"
 version = "0.1.0"
-description = "The MCP(Model Control Protocol) server that exposes reflector tool and CRAG resources to the agent client."
+description = "The MCP(Model Context Protocol) server that exposes a Reflection tool (leveraging MCP Sampling back to the client for LLM access) and a Corrective RAG resource (utilizing Tree-of-Thought and hierarchical domain indexing)."
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
-    "faiss-cpu>=1.14.2",
     "fastmcp>=3.3.1",
-    "langchain>=1.3.1",
-    "langchain-community>=0.4.2",
     "python-dotenv>=1.2.2",
     "tavily-python>=0.7.24",
 ]
