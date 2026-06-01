@@ -2,8 +2,10 @@ from mcp.types import SamplingMessage, TextContent as MCPTextContent
 import logging
 import os
 from datetime import datetime
+import json
 from dotenv import load_dotenv
 from fastmcp import FastMCP, Context
+from pydantic import BaseModel, Field
 from tavily import TavilyClient
 from knowledge_base import DOCUMENTS
 
@@ -24,6 +26,48 @@ mcp = FastMCP(
 )
 tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
+class CritiqueResponse(BaseModel):
+    factual_errors: list[str] = Field(
+        description="List of factual errors found in the draft answer"
+    )
+    missing_points: list[str] = Field(
+        description="Key points that are missing from the draft answer"
+    )
+    improvement_areas: list[str] = Field(
+        description="Specific areas that could be improved"
+    )
+    overall_quality: str = Field(
+        description="Overall quality rating: poor, fair, or good"
+    )
+
+
+class CorrectionResponse(BaseModel):
+    corrected_answer: str = Field(
+        description="The improved, corrected final answer for the farmer"
+    )
+    changes_made: list[str] = Field(
+        description="List of specific changes made from the original draft"
+    )
+
+
+class ToTScoreResponse(BaseModel):
+    analytical: int = Field(
+        ge=0, le=10,
+        description="0-10: does this chunk directly answer the query?"
+    )
+    contextual: int = Field(
+        ge=0, le=10,
+        description="0-10: is the parent document topically relevant to the query?"
+    )
+    practical: int = Field(
+        ge=0, le=10,
+        description="0-10: is this chunk actionable and useful for a farmer?"
+    )
+    reasoning: str = Field(
+        description="One sentence explaining the scores"
+    )
+
+
 
 # helpers
 def expand_query(query: str) -> str:
@@ -43,96 +87,193 @@ def expand_query(query: str) -> str:
     return expansions
 
 
-def hierarchical_search(queries: list[str]) -> list[dict]:
+def hierarchical_search(queries: list[str], top_k: int = 3) -> list[dict]:
     """
-    Hierarchical indexing, first match summaries (high-level),
-    then collect the detailed chunks from matched documents.
-    """
-    matched_docs = []
+    True two-level hierarchical retrieval.
 
+    Level 1 — Summary index: score every document by keyword overlap
+    between the expanded query set and the document summary.  Only the
+    top_k highest-scoring documents are promoted to level 2, keeping the
+    chunk search manageable regardless of corpus size.
+
+    Level 2 — Chunk index: for each candidate document compute a Jaccard
+    similarity between the query token set and every chunk's token set.
+    Only chunks with similarity > 0 are returned, sorted descending.
+    """
+    # rank documents by summary relevance
+    doc_scores: list[tuple[dict, float]] = []
     for doc in DOCUMENTS:
-        summary_lower = doc["summary"].lower()
+        summary_tokens = set(doc["summary"].lower().split())
+        score = 0.0
         for query in queries:
-            # check if any query keyword matches the summary
-            keywords = [word for word in query.lower().split() if len(word) > 4]
-            if any(keyword in summary_lower for keyword in keywords):
-                if doc not in matched_docs:
-                    matched_docs.append(doc)
-                break
+            query_tokens = {w for w in query.lower().split() if len(w) > 3}
+            score += len(query_tokens & summary_tokens)
+        if score > 0:
+            doc_scores.append((doc, score))
 
-    logger.info(f"Hierarchical search found {len(matched_docs)} relevant documents")
+    doc_scores.sort(key=lambda x: x[1], reverse=True)
+    candidate_docs = [doc for doc, _ in doc_scores[:top_k]]
 
-    # collect chunks from matched documents
-    results = []
-    for doc in matched_docs:
+    logger.info(
+        f"Level-1 search: {len(candidate_docs)} candidate documents "
+        f"(top_k={top_k}, corpus={len(DOCUMENTS)})"
+    )
+
+    # rank chunks to the query
+    results: list[dict] = []
+    for doc in candidate_docs:
         for chunk in doc["chunks"]:
-            results.append(
-                {
-                    "doc_id": doc["id"],
-                    "summary": doc["summary"],
-                    "chunk": chunk,
-                }
-            )
+            chunk_tokens = set(chunk.lower().split())
+            sim_total = 0.0
+            for query in queries:
+                query_tokens = {w for w in query.lower().split() if len(w) > 3}
+                union = query_tokens | chunk_tokens
+                if union:
+                    sim_total += len(query_tokens & chunk_tokens) / len(union)
+            if sim_total > 0:
+                results.append(
+                    {
+                        "doc_id": doc["id"],
+                        "summary": doc["summary"],
+                        "chunk": chunk,
+                        "similarity": round(sim_total, 4),
+                    }
+                )
 
+    results.sort(key=lambda x: x["similarity"], reverse=True)
+    logger.info(f"Level-2 search: {len(results)} chunks with similarity > 0")
     return results
 
 
-def tot_evaluate(chunks: list[dict], query: str) -> list[dict]:
+async def tot_evaluate(chunks: list[dict], query: str, ctx: Context) -> list[dict]:
     """
-    Tree-of-Thought evaluation, score each chunk across
-    3 reasoning paths and filter out low relevance results.
-    Threshold: average score must be >= 4 out of 10.
+    Tree-of-Thought (ToT) evaluation.
+
+    For each retrieved chunk the LLM is asked to reason along 3 independent
+    thought paths and return a structured score for each:
+
+    Path 1 — Analytical:  Does this chunk directly answer the query?
+    Path 2 — Contextual:  Is the parent document topically relevant?
+    Path 3 — Practical:   Is the chunk actionable / useful for a farmer?
+
+    Each path score is 0-10.  Chunks with avg >= 5 are retained.
+    The LLM response is validated against ToTScoreResponse before use;
+    on validation failure the chunk is conservatively dropped.
     """
-    logger.info("Initiating ToT Evaluation on retrieved chunks...")
+    logger.info("Initiating ToT Evaluation on retrieved chunks via LLM sampling...")
     scored = []
 
     for item in chunks:
-        chunk_lower = item["chunk"].lower()
-        query_keywords = [word for word in query.lower().split() if len(word) > 3]
-
-        keyword_hits = sum(1 for keyword in query_keywords if keyword in chunk_lower)
-        analytical_score = min(10, keyword_hits * 2 + 4)
-
-        summary_keywords = [
-            word for word in item["summary"].lower().split() if len(word) > 4
-        ]
-        summary_hits = sum(
-            1 for keyword in query_keywords if keyword in summary_keywords
-        )
-        creative_score = min(10, summary_hits * 3 + 2)
-
-        word_count = len(item["chunk"].split())
-        critical_score = min(10, word_count // 3)
-
-        avg_score = round((analytical_score + creative_score + critical_score) / 3, 2)
-
-        logger.info(
-            f"ToT scores for chunk [{item['doc_id']}]: "
-            f"analytical={analytical_score}, creative={creative_score}, "
-            f"critical={critical_score}, avg={avg_score}"
+        prompt = (
+            f"You are an agricultural knowledge evaluator.\n\n"
+            f"User Query: {query}\n\n"
+            f"Document Summary: {item['summary']}\n\n"
+            f"Chunk Text: {item['chunk']}\n\n"
+            f"Score this chunk along 3 independent reasoning paths:\n"
+            f"  Path 1 — Analytical (0-10): Does this chunk directly answer the query?\n"
+            f"  Path 2 — Contextual (0-10): Is the parent document topically relevant to the query?\n"
+            f"  Path 3 — Practical  (0-10): Is this chunk actionable and useful for a farmer?\n\n"
+            f"Respond ONLY with a valid JSON object — no markdown, no extra text:\n"
+            f'{{"analytical": <int>, "contextual": <int>, "practical": <int>, "reasoning": "<one sentence>"}}'  
         )
 
-        if avg_score >= 4:
-            item["tot_score"] = avg_score
-            scored.append(item)
+        try:
+            sample_result = await ctx.sample(
+                messages=[
+                    SamplingMessage(
+                        role="user",
+                        content=MCPTextContent(type="text", text=prompt),
+                    )
+                ],
+                max_tokens=150,
+            )
+            raw = sample_result.text.strip()
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+                raw = raw.strip()
 
-    logger.info(f"ToT kept {len(scored)}/{len(chunks)} chunks above threshold")
+            scores = ToTScoreResponse(**json.loads(raw))
+            avg = round((scores.analytical + scores.contextual + scores.practical) / 3, 2)
+
+            logger.info(
+                f"ToT chunk [{item['doc_id']}]: "
+                f"analytical={scores.analytical} | "
+                f"contextual={scores.contextual} | "
+                f"practical={scores.practical} | "
+                f"avg={avg} | reasoning=\"{scores.reasoning}\""
+            )
+            await ctx.info(
+                f"ToT [{item['doc_id']}] analytical={scores.analytical} "
+                f"contextual={scores.contextual} practical={scores.practical} avg={avg}"
+            )
+
+            if avg >= 5:
+                item["tot_score"] = avg
+                scored.append(item)
+
+        except Exception as exc:
+            logger.warning(f"ToT scoring failed for chunk [{item['doc_id']}]: {exc} — dropping chunk")
+
+    logger.info(f"ToT kept {len(scored)}/{len(chunks)} chunks (threshold=5)")
     return scored
+
+def parse_and_validate_critique(raw_text: str) -> CritiqueResponse:
+    """
+    Parse and validate the LLM's critique response against
+    the CritiqueResponse Pydantic model.
+    Raises ValueError if the response doesn't match the schema.
+    """
+    # Strip markdown code fences if present
+    clean = raw_text.strip()
+    if clean.startswith("```"):
+        clean = clean.split("```")[1]
+        if clean.startswith("json"):
+            clean = clean[4:]
+    clean = clean.strip()
+
+    try:
+        data = json.loads(clean)
+        return CritiqueResponse(**data)
+    except (json.JSONDecodeError, TypeError, ValueError) as e:
+        raise ValueError(f"Critique response failed validation: {e}\nRaw: {raw_text}")
+
+
+def parse_and_validate_correction(raw_text: str) -> CorrectionResponse:
+    """
+    Parse and validate the LLM's correction response against
+    the CorrectionResponse Pydantic model.
+    Raises ValueError if the response doesn't match the schema.
+    """
+    clean = raw_text.strip()
+    if clean.startswith("```"):
+        clean = clean.split("```")[1]
+        if clean.startswith("json"):
+            clean = clean[4:]
+    clean = clean.strip()
+
+    try:
+        data = json.loads(clean)
+        return CorrectionResponse(**data)
+    except (json.JSONDecodeError, TypeError, ValueError) as e:
+        raise ValueError(f"Correction response failed validation: {e}\nRaw: {raw_text}")
+
 
 
 # CRAG Resource
 @mcp.resource("knowledge://agriculture/docs/{query}")
-async def agricultural_knowledge(query: str) -> str:
+async def agricultural_knowledge(query: str, ctx: Context) -> str:
     """
     Hierarchical CRAG resource for agricultural domain knowledge.
-    Implements: multi-query expansion then hierarchical search then
-    Tree-of-Thought evaluation then Tavily fallback if needed.
+    Implements: multi-query expansion → hierarchical search →
+    Tree-of-Thought evaluation (LLM-based) → Tavily fallback if needed.
     """
     logger.info(f"CRAG resource queried with: '{query}'")
 
     expanded_queries = expand_query(query)
     retrieved_chunks = hierarchical_search(expanded_queries)
-    relevant_chunks = tot_evaluate(retrieved_chunks, query)
+    relevant_chunks = await tot_evaluate(retrieved_chunks, query, ctx)
 
     # Tavily fallback if ToT filtered everything out
     if not relevant_chunks:
@@ -177,7 +318,7 @@ async def reflect_on_answer(
     logger.info(f"Reflection tool invoked for query: '{original_query}'")
     await ctx.info(f"Reflection tool invoked for query: '{original_query}'")
 
-    # Critique Loop via MCP Sampling
+    # Critic loop via MCP Sampling
     logger.info("Requesting critique sample from client LLM via MCP Sampling...")
     await ctx.info("Initiating critique loop via MCP Sampling...")
 
@@ -191,20 +332,41 @@ async def reflect_on_answer(
                         f"You are an expert agricultural advisor reviewing an answer.\n\n"
                         f"Original Question: {original_query}\n\n"
                         f"Draft Answer: {draft_answer}\n\n"
-                        f"Critique this answer. Identify any factual errors, missing key points, "
-                        f"or areas that could be improved for a farmer or agronomist. "
-                        f"Be specific and concise."
+                        f"Critique this answer for a farmer or agronomist. "
+                        f"Respond ONLY with a valid JSON object — no markdown, no extra text:\n"
+                        f"{{\n"
+                        f'  "factual_errors": ["..."],\n'
+                        f'  "missing_points": ["..."],\n'
+                        f'  "improvement_areas": ["..."],\n'
+                        f'  "overall_quality": "poor|fair|good"\n'
+                        f"}}\n\n"
+                        f"Use empty arrays [] where a category has no entries."
                     ),
                 ),
             )
         ],
         max_tokens=500,
     )
-    critique_text = critique_result.text
+    raw_critique = critique_result.text
     logger.info("Critique sample received from client LLM")
     await ctx.info("Critique sample received from client LLM")
 
-    # Correction Loop via MCP Sampling
+    # Validate critique against Pydantic schema
+    try:
+        critique = parse_and_validate_critique(raw_critique)
+        critique_text = (
+            f"Quality: {critique.overall_quality}\n"
+            f"Factual errors: {', '.join(critique.factual_errors) or 'none'}\n"
+            f"Missing points: {', '.join(critique.missing_points) or 'none'}\n"
+            f"Improvement areas: {', '.join(critique.improvement_areas) or 'none'}"
+        )
+        logger.info(f"Critique validated — overall quality: {critique.overall_quality}")
+        await ctx.info(f"Critique validated — quality={critique.overall_quality}")
+    except ValueError as exc:
+        logger.warning(f"Critique validation failed, falling back to raw text: {exc}")
+        critique_text = raw_critique
+
+    # Correction loop via MCP Sampling
     logger.info("Requesting correction sample from client LLM via MCP Sampling...")
     await ctx.info("Initiating correction loop via MCP Sampling...")
 
@@ -219,27 +381,51 @@ async def reflect_on_answer(
                         f"Original Question: {original_query}\n\n"
                         f"Draft Answer: {draft_answer}\n\n"
                         f"Critique: {critique_text}\n\n"
-                        f"Now write an improved, corrected final answer that addresses "
-                        f"the critique. Be clear, accurate, and practical for a farmer."
+                        f"Write an improved final answer that addresses the critique. "
+                        f"Be clear, accurate, and practical for a farmer.\n"
+                        f"Respond ONLY with a valid JSON object — no markdown, no extra text:\n"
+                        f"{{\n"
+                        f'  "corrected_answer": "...",\n'
+                        f'  "changes_made": ["..."]\n'
+                        f"}}\n\n"
+                        f"List every specific change you made from the draft in changes_made."
                     ),
                 ),
             )
         ],
         max_tokens=700,
     )
-    corrected_answer = correction_result.text
+    raw_correction = correction_result.text
     logger.info("Correction sample received from client LLM")
     await ctx.info("Correction sample received from client LLM")
 
+    # Validate correction against Pydantic schema
+    try:
+        correction = parse_and_validate_correction(raw_correction)
+        corrected_answer = correction.corrected_answer
+        changes_summary = "\n".join(f"- {c}" for c in correction.changes_made)
+        logger.info(f"Correction validated — {len(correction.changes_made)} changes made")
+        await ctx.info(f"Correction validated — {len(correction.changes_made)} changes made")
+    except ValueError as exc:
+        logger.warning(f"Correction validation failed, falling back to raw text: {exc}")
+        corrected_answer = raw_correction
+        changes_summary = "N/A"
+
     return (
         f"[CRITIQUE]\n{critique_text}\n\n"
+        f"[CHANGES MADE]\n{changes_summary}\n\n"
         f"[CORRECTED ANSWER]\n{corrected_answer}"
     )
 
-#Run server
+# Run server
 def main():
-    logger.info("Starting Agricultural Advisory System MCP Server on streamable-http...")
-    mcp.run(transport="streamable-http")
+    host = os.getenv("MCP_HOST", "0.0.0.0")
+    port = int(os.getenv("MCP_PORT", "8000"))
+    logger.info(
+        f"Starting Agricultural Advisory System MCP Server "
+        f"on streamable-http at {host}:{port}..."
+    )
+    mcp.run(transport="streamable-http", host=host, port=port)
 
 
 if __name__ == "__main__":

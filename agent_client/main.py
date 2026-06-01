@@ -2,20 +2,15 @@ import asyncio
 import logging
 import os
 from dotenv import load_dotenv
+from fastmcp import Client
+from fastmcp.client.logging import LogMessage
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
 from langchain.agents import create_agent
-from langchain_core.messages import SystemMessage
-from langchain_mcp_adapters.client import MultiServerMCPClient
-from langchain_mcp_adapters.callbacks import Callbacks
-from mcp import ClientSession
-from mcp.client.streamable_http import streamable_http_client
-from mcp.shared.context import RequestContext
 from mcp.types import (
     CreateMessageRequestParams,
     CreateMessageResult,
     TextContent,
-    LoggingMessageNotificationParams,
 )
 
 load_dotenv()
@@ -56,14 +51,15 @@ llm = ChatOpenAI(
 
 
 async def sampling_handler(
-    ctx: RequestContext,
+    messages: list,
     params: CreateMessageRequestParams,
+    ctx,
 ) -> CreateMessageResult:
     logger.info("MCP Sampling request received from server, executing LLM locally...")
 
-    # Extract the prompt text from the MCP sampling message
+    # Extract the prompt text from the MCP sampling messages
     prompt_text = ""
-    for msg in params.messages:
+    for msg in messages:
         if hasattr(msg.content, "text"):
             prompt_text += msg.content.text + "\n"
 
@@ -81,12 +77,13 @@ async def sampling_handler(
     )
 
 
-async def server_log_handler(
-    params: LoggingMessageNotificationParams,
-    context,
-) -> None:
-    level = str(params.level).upper()
-    message = params.data if isinstance(params.data, str) else str(params.data)
+async def server_log_handler(log_message: LogMessage) -> None:
+    level = str(log_message.level).upper()
+    message = (
+        log_message.data
+        if isinstance(log_message.data, str)
+        else str(log_message.data)
+    )
 
     if level == "ERROR":
         server_logger.error(message)
@@ -101,78 +98,60 @@ async def server_log_handler(
 
 async def run_agent(user_query: str):
     logger.info(f"Agent started. User query: '{user_query}'")
-    callbacks = Callbacks(on_logging_message=server_log_handler)
 
-    # Initialize MCP client with callbacks
-    mcp_client = MultiServerMCPClient(
-        connections={
-            "agri_server": {
-                "url": "http://localhost:8000/mcp",
-                "transport": "streamable_http",
-            }
-        },
-        callbacks=callbacks,
-    )
+    async with Client(
+        "http://localhost:8000/mcp",
+        sampling_handler=sampling_handler,
+        log_handler=server_log_handler,
+    ) as client:
+        logger.info(
+            "MCP session initialised, sampling handler and server log handler registered"
+        )
 
-    logger.info("Connecting to MCP server with sampling support...")
-
-    async with streamable_http_client("http://localhost:8000/mcp") as (read, write, _):
-        async with ClientSession(
-            read,
-            write,
-            sampling_callback=sampling_handler,
-        ) as session:
-            await session.initialize()
-            logger.info("MCP session initialized with sampling handler registered")
-
-            # Fetch tools via the mcp_client (uses separate connections per call)
-            mcp_tools = await mcp_client.get_tools()
-            logger.info(f"Fetched {len(mcp_tools)} tools from MCP server")
-
-            @tool
-            async def reflection_tool(original_query: str, draft_answer: str) -> str:
-                """
-                Critiques and corrects a draft answer using true MCP Sampling.
-                The server calls ctx.sample() which fires our sampling_handler,
-                runs the LLM locally on the client, and returns the result.
-                """
-                logger.info("Calling remote reflection tool on MCP server...")
-
-                # Call the tool directly via the sampling-enabled session
-                result = await session.call_tool(
-                    "reflect_on_answer",
-                    arguments={
-                        "original_query": original_query,
-                        "draft_answer": draft_answer,
-                    },
+        @tool
+        async def crag_knowledge_tool(query: str) -> str:
+            """
+            Queries the agricultural knowledge base on the MCP server.
+            Uses hierarchical search (2-level) + Tree-of-Thought + Tavily fallback.
+            """
+            logger.info(f"Querying CRAG resource with: '{query}'")
+            try:
+                results = await client.read_resource(
+                    f"knowledge://agriculture/docs/{query}"
                 )
-                logger.info("Reflection tool response received")
-                if result.content:
-                    return result.content[0].text
-                return "No reflection result"
+                logger.info("CRAG resource response received")
+                if results:
+                    item = results[0]
+                    return item.text if hasattr(item, "text") else item.blob.decode()
+                return "No knowledge found"
+            except Exception as e:
+                logger.error(f"CRAG resource error: {e}")
+                return f"Knowledge retrieval failed: {e}"
 
-            @tool
-            async def crag_knowledge_tool(query: str) -> str:
-                """
-                Queries the agricultural knowledge base on the MCP server.
-                Uses hierarchical search + Tree-of-Thought + Tavily fallback.
-                """
-                logger.info(f"Querying CRAG resource with: '{query}'")
-                try:
-                    result = await session.read_resource(
-                        f"knowledge://agriculture/docs/{query}"
-                    )
-                    logger.info("CRAG resource response received")
-                    if result and result.contents:
-                        return result.contents[0].text
-                    return "No knowledge found"
-                except Exception as e:
-                    logger.error(f"CRAG resource error: {e}")
-                    return f"Knowledge retrieval failed: {e}"
+        @tool
+        async def reflection_tool(original_query: str, draft_answer: str) -> str:
+            """
+            Critiques and corrects a draft answer using true MCP Sampling.
+            The server calls ctx.sample() which fires the sampling_handler,
+            runs the LLM locally on this client, and returns the validated result.
+            """
+            logger.info("Calling remote reflection tool on MCP server...")
+            result = await client.call_tool(
+                "reflect_on_answer",
+                arguments={
+                    "original_query": original_query,
+                    "draft_answer": draft_answer,
+                },
+            )
+            logger.info("Reflection tool response received")
+            if result.content:
+                block = result.content[0]
+                return block.text if hasattr(block, "text") else str(block)
+            return "No reflection result"
 
-            tools = [reflection_tool, crag_knowledge_tool]
+        tools = [crag_knowledge_tool, reflection_tool]
 
-            system_prompt = """You are an expert agricultural advisor assistant.
+        system_prompt = """You are an expert agricultural advisor assistant.
 
 You MUST always follow these steps in order for EVERY question:
 1. ALWAYS call crag_knowledge_tool first to retrieve relevant knowledge
@@ -181,29 +160,29 @@ You MUST always follow these steps in order for EVERY question:
 4. Return the final corrected answer from the reflection tool
 """
 
-            agent = create_agent(
-                model=llm,
-                tools=tools,
-                system_prompt=system_prompt,
+        agent = create_agent(
+            model=llm,
+            tools=tools,
+            system_prompt=system_prompt,
+        )
+
+        logger.info("Agent ready. Sending query...")
+
+        try:
+            response = await agent.ainvoke(
+                {
+                    "messages": [{"role": "user", "content": user_query}],
+                },
             )
+            final_answer = response["messages"][-1].content
+            logger.info(f"Agent final answer: {final_answer}")
+            print(f"\n{'='*60}")
+            print(f"FINAL ANSWER:\n{final_answer}")
+            print(f"{'='*60}\n")
 
-            logger.info("Agent ready. Sending query...")
-
-            try:
-                response = await agent.ainvoke(
-                    {
-                        "messages": [{"role": "user", "content": user_query}],
-                    },
-                )
-                final_answer = response["messages"][-1].content
-                logger.info(f"Agent final answer: {final_answer}")
-                print(f"\n{'='*60}")
-                print(f"FINAL ANSWER:\n{final_answer}")
-                print(f"{'='*60}\n")
-
-            except Exception as e:
-                logger.error(f"Agent execution failed: {e}")
-                raise
+        except Exception as e:
+            logger.error(f"Agent execution failed: {e}")
+            raise
 
 
 if __name__ == "__main__":
